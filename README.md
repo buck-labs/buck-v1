@@ -1,6 +1,6 @@
 # Strong DAO Smart Contracts
 
-> Production-grade, upgradeable contracts that back the BUCK savingscoin with on-chain USDC reserves and attested STRC equity. For a narrative view of the protocol, pair this README with the architecture note in `../strong-ADR/strongArch.md`.
+> Production-grade, upgradeable contracts that back the BUCK savingscoin with on-chain USDC reserves and attested STRC equity. Audited by Cyfrin, Halborn and Spearbit.
 
 ## Key Concepts
 
