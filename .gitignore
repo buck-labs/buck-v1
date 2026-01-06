@@ -1,0 +1,52 @@
+# Foundry build artifacts
+/out/
+/cache/
+lib/**/out/
+lib/**/cache/
+
+# Broadcast
+broadcast/
+
+# Node
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+*.swp
+*~
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.sublime-*
+
+# Security tools
+.slither-venv/
+.mythril-venv/
+.mythril/
+.crytic-cache/
+crytic-export/
+.slither/
+slither-report.*
+slither.db*
+slither.log
+*.sarif
+.solcx/
+
+# Claude Code
+.claude/
+
+# Secrets
+*.key
+*.csr
+*.pem
+secrets/
