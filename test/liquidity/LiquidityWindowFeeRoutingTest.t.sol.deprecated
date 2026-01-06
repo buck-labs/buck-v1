@@ -1,0 +1,341 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import {BaseTest} from "test/utils/BaseTest.sol";
+import {LiquidityWindow} from "src/liquidity/LiquidityWindow.sol";
+import {LiquidityReserve} from "src/liquidity/LiquidityReserve.sol";
+import {STRX} from "src/token/STRX.sol";
+import {PolicyManager} from "src/policy/PolicyManager.sol";
+import {MockUSDC} from "src/mocks/MockUSDC.sol";
+
+// Mock Oracle
+contract MockOracle {
+    uint256 public price;
+    uint256 public updatedAt;
+    uint256 public lastBlock;
+
+    constructor(uint256 _price) {
+        price = _price;
+        updatedAt = block.timestamp;
+        lastBlock = block.number;
+    }
+
+    function latestPrice() external view returns (uint256, uint256) {
+        return (price, updatedAt);
+    }
+
+    function isHealthy(uint256) external pure returns (bool) {
+        return true;
+    }
+
+    function lastPriceUpdateBlock() external view returns (uint256) {
+        return lastBlock;
+    }
+}
+
+/**
+ * @title LiquidityWindowFeeRoutingTest
+ * @notice Unit tests specifically for fee routing mechanics in LiquidityWindow
+ */
+contract LiquidityWindowFeeRoutingTest is BaseTest {
+    LiquidityWindow internal window;
+    LiquidityReserve internal reserve;
+    STRX internal strc;
+    PolicyManager internal policy;
+    MockUSDC internal usdc;
+    MockOracle internal oracle;
+
+    address internal constant TIMELOCK = address(0x1000);
+    address internal constant TREASURY = address(0x2000);
+    address internal constant ALICE = address(0x3000);
+    address internal constant GUARDIAN = address(0x4000);
+
+    uint256 internal constant PRICE = 0.97e18; // $0.97 per STRC
+
+    function setUp() public {
+        vm.startPrank(TIMELOCK);
+
+        // Deploy contracts
+        usdc = new MockUSDC();
+        strc = new STRX(TIMELOCK);
+        policy = new PolicyManager(TIMELOCK, GUARDIAN);
+        oracle = new MockOracle(PRICE);
+
+        // Deploy liquidity contracts
+        reserve = new LiquidityReserve(TIMELOCK, address(usdc), address(0), TREASURY); // Window set later
+        window = new LiquidityWindow(
+            TIMELOCK,
+            address(strc),
+            address(reserve),
+            address(policy)
+        );
+
+        // Configure connections
+        strc.configureModules(address(window), address(0), address(0), address(0), address(0), address(0));
+        reserve.setLiquidityWindow(address(window));
+        window.setUSDC(address(usdc));
+        window.configureOracle(address(oracle), 3600); // 1 hour staleness
+
+        // Register LiquidityWindow as operator in PolicyManager
+        policy.setOperator(address(window), true);
+
+        // Set GREEN band in policy
+        policy.reportSystemSnapshot(
+            PolicyManager.SystemSnapshot({
+                reserveRatioBps: 1000,  // 10% for GREEN band
+                equityBufferBps: 2000,
+                oracleDeviationBps: 0,
+                oracleStaleSeconds: 0,
+                dailyRefundBps: 0,
+                marketIsOpen: true,
+                totalSupply: 1000000e18,
+                navPerToken: 1e18,
+                reserveBalance: 500000e6,
+                activeLiquidityStewards: 1
+            })
+        );
+
+        vm.stopPrank();
+
+        // Move past block-fresh window after oracle creation
+        vm.roll(block.number + 2);
+
+        // Fund test users
+        usdc.mint(ALICE, 100_000e6);
+        usdc.mint(address(reserve), 1_000_000e6);
+    }
+
+    // =====================================================
+    //           FEE ROUTING TESTS
+    // =====================================================
+
+    function testMintFeeRouting_70_30_Split() public {
+        uint256 usdcAmount = 10_000e6; // 10,000 USDC
+        uint256 expectedFee = (usdcAmount * 5) / 10000; // 0.05% = 5 USDC (GREEN band fee)
+
+        vm.startPrank(ALICE);
+        usdc.approve(address(window), usdcAmount);
+
+        // Track balances before
+        uint256 reserveBefore = usdc.balanceOf(address(reserve));
+        uint256 treasuryBefore = usdc.balanceOf(TREASURY);
+
+        // Configure 70/30 split
+        vm.startPrank(TIMELOCK);
+        window.configureFeeSplit(7000, TREASURY); // 70% to reserve
+        vm.stopPrank();
+
+        // Mint STRC
+        vm.prank(ALICE);
+        window.requestMint(ALICE, usdcAmount, 0, type(uint256).max);
+
+        // Check that all USDC went to reserve initially
+        uint256 reserveAfter = usdc.balanceOf(address(reserve));
+        assertEq(reserveAfter - reserveBefore, usdcAmount, "Reserve should receive all USDC");
+
+        // Treasury shouldn't have direct balance yet
+        uint256 treasuryAfter = usdc.balanceOf(TREASURY);
+        assertEq(treasuryAfter - treasuryBefore, 0, "Treasury should not receive direct transfer");
+
+        // Check that withdrawal is queued for treasury
+        LiquidityReserve.WithdrawalRequest memory withdrawal = reserve.getWithdrawal(0);
+        assertEq(withdrawal.to, TREASURY, "Treasury should be queued recipient");
+
+        // Calculate expected split
+        uint256 expectedToReserve = (expectedFee * 7000) / 10000; // 70% = 3.5 USDC
+        uint256 expectedToTreasury = expectedFee - expectedToReserve; // 30% = 1.5 USDC
+        assertEq(withdrawal.amount, expectedToTreasury, "Treasury should have 30% queued");
+    }
+
+    function testRefundFeeRouting_70_30_Split() public {
+        // First mint some STRC
+        uint256 mintAmount = 10_000e6;
+        vm.startPrank(ALICE);
+        usdc.approve(address(window), mintAmount);
+        window.requestMint(ALICE, mintAmount, 0, type(uint256).max);
+
+        // Now refund a small portion of STRC to stay under cap
+        uint256 strcBalance = strc.balanceOf(ALICE);
+        uint256 refundAmount = strcBalance / 100; // Refund only 1% to stay under caps
+        strc.approve(address(window), refundAmount);
+
+        // Configure fee split
+        vm.startPrank(TIMELOCK);
+        window.configureFeeSplit(7000, TREASURY);
+        vm.stopPrank();
+
+        // Calculate expected refund and fees
+        uint256 refundPrice = (PRICE * 9975) / 10000; // Price with negative spread
+        uint256 grossUsdc = (refundAmount * refundPrice) / 1e18 / 1e12;
+        uint256 refundFee = (grossUsdc * 5) / 10000; // 0.05% fee (GREEN band)
+
+        // Track withdrawal queue length before
+        uint256 queueLengthBefore = reserve.withdrawalCount();
+
+        // Refund
+        vm.prank(ALICE);
+        window.requestRefund(ALICE, refundAmount, 0, 0);
+
+        // Check new withdrawal queued for treasury (30% of refund fee)
+        if (refundFee > 0) {
+            uint256 queueLengthAfter = reserve.withdrawalCount();
+            assertGt(queueLengthAfter, queueLengthBefore, "Should queue treasury withdrawal");
+
+            // Check last queued withdrawal
+            LiquidityReserve.WithdrawalRequest memory withdrawal = reserve.getWithdrawal(queueLengthAfter - 1);
+            assertEq(withdrawal.to, TREASURY, "Treasury should be recipient");
+
+            uint256 expectedToTreasury = (refundFee * 3000) / 10000; // 30%
+            assertApproxEqRel(withdrawal.amount, expectedToTreasury, 0.01e18, "Treasury should get ~30% of fee");
+        }
+    }
+
+    function testFeeSplit_100_Percent_Reserve() public {
+        vm.prank(TIMELOCK);
+        window.configureFeeSplit(10000, TREASURY); // 100% to reserve
+
+        uint256 usdcAmount = 10_000e6;
+
+        vm.startPrank(ALICE);
+        usdc.approve(address(window), usdcAmount);
+        window.requestMint(ALICE, usdcAmount, 0, type(uint256).max);
+
+        // Check no withdrawal queued (all fees stay in reserve)
+        uint256 queueLength = reserve.withdrawalCount();
+        if (queueLength > 0) {
+            LiquidityReserve.WithdrawalRequest memory withdrawal = reserve.getWithdrawal(0);
+            assertEq(withdrawal.amount, 0, "No treasury withdrawal when 100% to reserve");
+        }
+    }
+
+    function testFeeSplit_100_Percent_Treasury() public {
+        vm.prank(TIMELOCK);
+        window.configureFeeSplit(0, TREASURY); // 0% to reserve = 100% to treasury
+
+        uint256 usdcAmount = 10_000e6;
+        uint256 expectedFee = (usdcAmount * 5) / 10000; // 5 USDC fee (GREEN band)
+
+        vm.startPrank(ALICE);
+        usdc.approve(address(window), usdcAmount);
+        window.requestMint(ALICE, usdcAmount, 0, type(uint256).max);
+
+        // Check full fee queued for treasury
+        LiquidityReserve.WithdrawalRequest memory withdrawal = reserve.getWithdrawal(0);
+        assertEq(withdrawal.to, TREASURY, "Treasury should be recipient");
+        assertEq(withdrawal.amount, expectedFee, "Treasury should get 100% of fee");
+    }
+
+    function testMultipleTransactionsFeeAccumulation() public {
+        vm.prank(TIMELOCK);
+        window.configureFeeSplit(7000, TREASURY); // 70/30 split
+
+        // Test fee accumulation with a single large mint
+        uint256 usdcAmount = 50_000e6; // 50,000 USDC
+        uint256 expectedFee = (usdcAmount * 5) / 10000; // 25 USDC fee at 0.05%
+        uint256 expectedToTreasury = (expectedFee * 3000) / 10000; // 30% = 7.5 USDC
+
+        vm.startPrank(ALICE);
+        usdc.approve(address(window), usdcAmount);
+
+        // Fund Alice with more USDC for this test
+        vm.stopPrank();
+        usdc.mint(ALICE, usdcAmount);
+
+        vm.prank(ALICE);
+        window.requestMint(ALICE, usdcAmount, 0, type(uint256).max);
+
+        // Check treasury withdrawal is queued correctly
+        uint256 actualQueued = 0;
+        uint256 queueLength = reserve.withdrawalCount();
+
+        for (uint i = 0; i < queueLength; i++) {
+            LiquidityReserve.WithdrawalRequest memory withdrawal = reserve.getWithdrawal(i);
+            if (withdrawal.to == TREASURY) {
+                actualQueued += withdrawal.amount;
+            }
+        }
+
+        assertEq(actualQueued, expectedToTreasury, "Treasury should receive 30% of fees");
+
+        // Verify reserve balance
+        // The reserve receives ALL USDC initially and holds it
+        // Treasury's portion is just queued for withdrawal, not immediately transferred
+        // So reserve balance = initial + all USDC from mint
+        uint256 reserveBalance = usdc.balanceOf(address(reserve));
+        uint256 expectedReserveBalance = 1_000_000e6 + usdcAmount;
+
+        assertEq(reserveBalance, expectedReserveBalance, "Reserve should hold all USDC including queued treasury portion");
+    }
+
+    function testFeeRoutingWithZeroFees() public {
+        // Set fees to 0
+        vm.prank(TIMELOCK);
+        strc.setSwapFees(0, 0); // No buy/sell fees
+
+        uint256 usdcAmount = 10_000e6;
+
+        vm.startPrank(ALICE);
+        usdc.approve(address(window), usdcAmount);
+
+        uint256 queueBefore = reserve.withdrawalCount();
+        window.requestMint(ALICE, usdcAmount, 0, type(uint256).max);
+        uint256 queueAfter = reserve.withdrawalCount();
+
+        assertEq(queueAfter, queueBefore, "No withdrawals should be queued with 0 fees");
+    }
+
+    function testTreasuryWithdrawalExecution() public {
+        // Setup: mint with fees to create treasury withdrawal
+        vm.startPrank(TIMELOCK);
+        window.configureFeeSplit(7000, TREASURY);
+        vm.stopPrank();
+
+        uint256 usdcAmount = 10_000e6;
+        vm.startPrank(ALICE);
+        usdc.approve(address(window), usdcAmount);
+        window.requestMint(ALICE, usdcAmount, 0, type(uint256).max);
+        vm.stopPrank(); // Stop ALICE prank
+
+        // Get queued withdrawal info
+        LiquidityReserve.WithdrawalRequest memory withdrawal = reserve.getWithdrawal(0);
+        assertEq(withdrawal.to, TREASURY, "Treasury should be recipient");
+
+        // Execute withdrawal
+        uint256 treasuryBefore = usdc.balanceOf(TREASURY);
+
+        // Warp if needed (small withdrawals are instant)
+        if (block.timestamp < withdrawal.releaseAt) {
+            vm.warp(withdrawal.releaseAt);
+        }
+
+        vm.prank(TIMELOCK);
+        reserve.executeWithdrawal(0);
+
+        uint256 treasuryAfter = usdc.balanceOf(TREASURY);
+        assertEq(treasuryAfter - treasuryBefore, withdrawal.amount, "Treasury should receive queued amount");
+    }
+
+    function testFeeRoutingEvents() public {
+        vm.prank(TIMELOCK);
+        window.configureFeeSplit(6000, TREASURY); // 60/40 split
+
+        uint256 usdcAmount = 5_000e6;
+        uint256 expectedFee = (usdcAmount * 5) / 10000; // 2.5 USDC (GREEN band)
+
+        // Test that proper events are emitted for fee routing
+        vm.startPrank(ALICE);
+        usdc.approve(address(window), usdcAmount);
+
+        // The DepositRecorded event is emitted from LiquidityReserve
+        // First deposit is the reserve fee portion (60% of 2.5 USDC = 1.5 USDC)
+        uint256 reserveFee = (expectedFee * 6000) / 10000;
+        vm.expectEmit(true, false, false, true, address(reserve));
+        emit DepositRecorded(address(window), reserveFee);
+
+        window.requestMint(ALICE, usdcAmount, 0, type(uint256).max);
+    }
+
+    // Events for testing
+    event DepositRecorded(address indexed from, uint256 amount);
+    event WithdrawalQueued(uint256 indexed id, address indexed to, uint256 amount);
+}
