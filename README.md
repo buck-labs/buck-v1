@@ -7,13 +7,13 @@
 - **BUCK vs STRC:** BUCK = on-chain ERC-20; STRC = MicroStrategy STRETCH note (brokerage custody)
 - **Savingscoin:** Maintains $1.00 via overcollateralization (CR ≥ 1), absorbs STRC volatility with reserve buffers
 - **CAP pricing:** $1.00 when CR ≥ 1, else max(P_STRC/100, CR) → auto-repegs when CR recovers
-- **Collateral Ratio (CR):** (R + HC×V) / L where R = Reserve USDC, V = brokerage STRC value, HC = haircut (0.98), L = supply
+- **Collateral Ratio (CR):** (R + HC×V) / L where R = Reserve USDC, V = brokerage STRC value, HC = haircut (set to 0 initially), L = supply
 
 ## System Overview
 
 - **Primary market:** Access-gated stewards mint and refund BUCK through `LiquidityWindow`, which prices against a collateral-aware peg (CAP) and enforces fee bands, per-account caps, and oracle freshness. Net USDC flows straight into the `LiquidityReserve`.
 - **Treasury & solvency controls:** `PolicyManager` watches reserve ratios, attestation health, and oracle feeds. It flips the system between Green/Yellow/Red/Emergency bands, publishing spreads, fees, and mint/refund allowances that the other modules consume.
-- **Collateral truth:** `CollateralAttestation` is the on-chain copy of the off-chain STRC valuation. It outputs a haircut-adjusted collateral ratio that powers CAP pricing, oracle strict-mode toggles, and governance alerts.
+- **Collateral truth:** `CollateralAttestation` is the on-chain copy of the off-chain STRC valuation. It outputs a collateral ratio that powers CAP pricing, oracle strict-mode toggles, and governance alerts.
 - **Governance token:** `BUCK` is an ERC20Permit token with upgradeable hooks. LiquidityWindow/Re­wardsEngine are the only minters, DEX transfers are tollable per band, and all balance movements stream into the rewards system.
 - **Yield pass-through:** Coupon USDC is routed through `RewardsEngine`, skimmed per policy, and reminted as BUCK for holders using balance–time accounting. Anti-snipe timers and mint ceilings prevent distribution gaming.
 - **Access control:** `AccessRegistry` keeps a rolling Merkle tree of approved wallets. LiquidityWindow enforces it at mint/refund time, while BUCK leaves secondary trading permissionless.
@@ -96,13 +96,13 @@
 
 ### CollateralAttestation (`src/collateral/CollateralAttestation.sol`)
 
-- **Role:** Single source of truth for off-chain STRC valuations, haircuts, and freshness.
+- **Role:** Single source of truth for off-chain STRC valuations and freshness.
 - **Key storage**
   - `V` (raw valuation), `HC` (haircut coefficient), and timestamps for both measurement and submission.
   - `healthyStaleness` / `stressedStaleness` thresholds define how often attestations must land depending on CR.
   - Contract references to BUCK, the reserve, treasury, and USDC allow live CR computation without manual snapshots.
 - **Important flows**
-  - `publishAttestation` (ATTESTOR_ROLE) validates staleness against the CR implied by the new data, then records valuation & haircut.
+  - `publishAttestation` (ATTESTOR_ROLE) validates staleness against the CR implied by the new data, then records valuation.
   - `getCollateralRatio` computes `(reserve + HC * V) / liabilities`, explicitly excluding treasury USDC.
   - `isAttestationStale`, `timeSinceLastAttestation`, and `isHealthyCollateral` are lightweight views consumed by PolicyManager and client dashboards.
   - Admin setters (`setContractReferences`, `setStalenessThresholds`, `setHaircut`, `setTreasury`) keep the module configurable without redeploys.
